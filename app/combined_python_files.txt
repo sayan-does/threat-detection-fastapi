@@ -1,0 +1,291 @@
+Combined Python Files - Generated on 2025-01-17 12:22:31
+
+Directory: I:\threat-detection-fastapi\app
+
+================================================================================
+
+
+File: _init_.py
+===============
+
+
+================================================================================
+
+
+File: main.py
+=============
+# app/main.py
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+from pathlib import Path
+import cv2
+import numpy as np
+from PIL import Image
+import io
+import tempfile
+from typing import List, Optional
+import logging
+import traceback
+
+from models import DetectionResponse, DetectionResult
+from services import ModelService
+import settings
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Threat Detection API",
+    description="API for detecting threats in images and videos using YOLOv8",
+    version="1.0.0"
+)
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize model service
+model_service = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the model on startup"""
+    global model_service
+    try:
+        logger.info("Initializing model service...")
+        model_service = ModelService()
+        model_path = Path(settings.DETECTION_MODEL)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found at {model_path}")
+        model_service.initialize_model(str(model_path))
+        logger.info("Model initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize model: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+@app.get("/")
+async def root():
+    """Root endpoint to check API status"""
+    return {"status": "online", "message": "Threat Detection API is running"}
+
+@app.post("/detect/image", response_model=DetectionResponse)
+async def detect_image(
+    file: UploadFile = File(...),
+    confidence: float = 0.5
+):
+    """Detect threats in an uploaded image"""
+    global model_service
+    
+    try:
+        logger.info(f"Processing image detection request: {file.filename}")
+        
+        # Validate model service
+        if model_service is None:
+            raise RuntimeError("Model service not initialized")
+        
+        # Validate file type
+        if file.content_type not in settings.SUPPORTED_IMAGE_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Supported types: {settings.SUPPORTED_IMAGE_TYPES}"
+            )
+        
+        # Read and validate image
+        try:
+            contents = await file.read()
+            image = Image.open(io.BytesIO(contents))
+            image = image.convert('RGB')  # Ensure image is in RGB format
+        except Exception as e:
+            logger.error(f"Error reading image: {str(e)}")
+            raise HTTPException(status_code=400, detail="Invalid image file")
+        
+        # Validate confidence
+        if not 0 <= confidence <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Confidence must be between 0 and 1"
+            )
+        
+        # Perform detection
+        logger.info("Performing detection...")
+        results = model_service.detect_image(image, confidence)
+        logger.info(f"Detection completed. Found {len(results.detections)} threats")
+        
+        return results
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing image: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+@app.get("/model/info")
+async def get_model_info():
+    """Get information about the loaded model"""
+    global model_service
+    try:
+        return {
+            "model_path": str(settings.DETECTION_MODEL),
+            "status": "loaded" if model_service and model_service.model else "not_loaded",
+            "initialized": model_service is not None
+        }
+    except Exception as e:
+        logger.error(f"Error getting model info: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+================================================================================
+
+
+File: models.py
+===============
+from pathlib import Path
+import sys
+
+# Get the absolute path of the current file
+file_path = Path(__file__).resolve()
+root_path = file_path.parent
+
+# Add the root path to the sys.path list if it is not already there
+if root_path not in sys.path:
+    sys.path.append(str(root_path))
+
+# ML Model config
+DETECTION_MODEL = root_path / 'data' / 'models' / 'BestFinal.pt'
+
+# API Settings
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
+SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/bmp", "image/webp"]
+SUPPORTED_VIDEO_TYPES = ["video/mp4", "video/x-msvideo"]
+
+# Logging config
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+LOG_LEVEL = 'INFO'
+
+================================================================================
+
+
+File: services.py
+=================
+# app/services.py
+from pathlib import Path
+import cv2
+import numpy as np
+from PIL import Image
+import time
+from ultralytics import YOLO
+from typing import List, Optional
+import logging
+
+from models import DetectionResponse, DetectionResult
+
+logger = logging.getLogger(__name__)
+
+class ModelService:
+    def __init__(self):
+        self.model = None
+
+    def initialize_model(self, model_path: str):
+        """Initialize the YOLO model"""
+        try:
+            logger.info(f"Loading model from {model_path}")
+            if not Path(model_path).exists():
+                raise FileNotFoundError(f"Model file not found at {model_path}")
+            
+            self.model = YOLO(model_path)
+            logger.info("Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load model: {str(e)}")
+            raise
+
+    def _process_results(self, results) -> DetectionResponse:
+        """Process YOLO results into structured response"""
+        try:
+            detections = []
+            
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    detection = DetectionResult(
+                        class_id=int(box.cls),
+                        class_name=result.names[int(box.cls)],
+                        confidence=float(box.conf),
+                        bbox=box.xyxy[0].tolist()
+                    )
+                    detections.append(detection)
+
+            return DetectionResponse(
+                detections=detections,
+                processing_time=results[0].speed.get('inference', 0)
+            )
+        except Exception as e:
+            logger.error(f"Error processing results: {str(e)}")
+            raise
+
+    def detect_image(self, image: Image.Image, conf: float) -> DetectionResponse:
+        """Perform detection on a single image"""
+        try:
+            if self.model is None:
+                raise RuntimeError("Model not initialized")
+
+            # Convert PIL Image to numpy array if needed
+            if isinstance(image, Image.Image):
+                image = np.array(image)
+
+            logger.info("Running inference on image...")
+            results = self.model.predict(image, conf=conf)
+            logger.info("Inference completed")
+            
+            return self._process_results(results)
+            
+        except Exception as e:
+            logger.error(f"Error in detect_image: {str(e)}")
+            raise
+
+================================================================================
+
+
+File: settings.py
+=================
+from pathlib import Path
+import sys
+
+# Get the absolute path of the current file
+file_path = Path(__file__).resolve()
+root_path = file_path.parent
+
+# Add the root path to the sys.path list if it is not already there
+if root_path not in sys.path:
+    sys.path.append(str(root_path))
+
+# ML Model config
+DETECTION_MODEL = root_path / 'data' / 'models' / 'BestFinal.pt'
+
+# API Settings
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
+SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/bmp", "image/webp"]
+SUPPORTED_VIDEO_TYPES = ["video/mp4", "video/x-msvideo"]
+
+# Logging config
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+LOG_LEVEL = 'INFO'
+
+================================================================================
+
