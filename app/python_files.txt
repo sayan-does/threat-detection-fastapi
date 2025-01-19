@@ -1,4 +1,4 @@
-Combined Python Files - Generated on 2025-01-18 00:22:54
+Combined Python Files - Generated on 2025-01-20 00:13:38
 
 Directory: I:\threat-detection-fastapi\app
 
@@ -14,9 +14,9 @@ File: _init_.py
 
 File: main.py
 =============
-# app/main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask 
 import uvicorn
 from pathlib import Path
 import cv2
@@ -27,6 +27,9 @@ import tempfile
 from typing import List, Optional
 import logging
 import traceback
+from fastapi.responses import FileResponse
+import sys
+import os
 
 from app.models import DetectionResponse, DetectionResult
 from app.services import ModelService
@@ -35,7 +38,11 @@ from app.settings import *
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('api.log')
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -57,16 +64,17 @@ app.add_middleware(
 # Initialize model service
 model_service = None
 
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the model on startup"""
     global model_service
     try:
-        logger.info("Initializing model service...")
+        logger.info("Initializing model service...") #from yolo, putting in my wights
         model_service = ModelService()
         model_path = Path(DETECTION_MODEL)
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found at {model_path}")
+
         model_service.initialize_model(str(model_path))
         logger.info("Model initialized successfully")
     except Exception as e:
@@ -74,13 +82,14 @@ async def startup_event():
         logger.error(traceback.format_exc())
         raise
 
+
 @app.get("/")
 async def root():
     """Root endpoint to check API status"""
     return {"status": "online", "message": "Threat Detection API is running"}
 
+
 def process_image(contents: bytes) -> np.ndarray:
-    """Process uploaded image bytes into numpy array"""
     try:
         # First try using PIL
         image = Image.open(io.BytesIO(contents))
@@ -89,81 +98,420 @@ def process_image(contents: bytes) -> np.ndarray:
     except Exception as pil_error:
         logger.warning(f"PIL failed to open image: {str(pil_error)}")
         try:
-            # Fallback to OpenCV
+            # open cv trial
             nparr = np.frombuffer(contents, np.uint8)
             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if image is None:
                 raise ValueError("OpenCV failed to decode image")
-            # Convert BGR to RGB
+            # convert BGR to RGB
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             return image
         except Exception as cv_error:
             logger.error(f"OpenCV failed to open image: {str(cv_error)}")
-            raise ValueError("Failed to process image with both PIL and OpenCV")
+            raise ValueError(
+                "Failed to process image with both PIL and OpenCV")
+
 
 @app.post("/detect/image", response_model=DetectionResponse)
 async def detect_image(
     file: UploadFile = File(...),
     confidence: float = 0.5
 ):
-    """Detect threats in an uploaded image"""
-    global model_service
-    
+    """
+    Detect threats in an uploaded image
+    """
     try:
         logger.info(f"Processing image detection request: {file.filename}")
-        
-        # Validate model service
+
+        # check model service
         if model_service is None:
             raise RuntimeError("Model service not initialized")
-        
+
         # Validate file type
         if file.content_type not in SUPPORTED_IMAGE_TYPES:
+            logger.warning(f"Unsupported file type: {file.content_type}")
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid file type. Supported types: {SUPPORTED_IMAGE_TYPES}"
             )
-        
+
+        # read and process image
+        try:
+            contents = await file.read()
+            logger.info(f"Read image data: {len(contents)} bytes")
+
+            image = process_image(contents)
+            logger.info(f"Processed image shape: {image.shape}")
+
+            if image is None or image.size == 0:
+                raise ValueError("Failed to load image")
+
+        except Exception as e:
+            logger.error(f"Error processing image: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to process image: {str(e)}"
+            )
+
+        # confidence
+        if not 0 <= confidence <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Confidence must be between 0 and 1"
+            )
+
+        # detection
+        try:
+            logger.info("Running detection...")
+            results = model_service.detect_image(image, confidence)
+            logger.info(
+                f"Detection completed with {len(results.detections)} results")
+
+        except Exception as e:
+            logger.error(f"Error during detection: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Detection failed: {str(e)}"
+            )
+
+        # Draw bounding boxes
+        try:
+            image_rgb = image.copy()
+            for detection in results.detections:
+                x1, y1, x2, y2 = detection.bbox
+                cv2.rectangle(
+                    image_rgb,
+                    (int(x1), int(y1)),
+                    (int(x2), int(y2)),
+                    (0, 255, 0),
+                    2
+                )
+                cv2.putText(
+                    image_rgb,
+                    f"{detection.class_name} ({detection.confidence:.2f})",
+                    (int(x1), int(y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    2
+                )
+
+            # Convert to BGR for OpenCV operations
+            image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+            _, buffer = cv2.imencode(".jpg", image_bgr)
+            image_bytes = buffer.tobytes()
+
+            return DetectionResponse(
+                detections=results.detections,
+                processing_time=results.processing_time,
+                image=image_bytes
+            )
+
+        except Exception as e:
+            logger.error(f"Error drawing detections: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process detection results: {str(e)}"
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        )
+
+
+@app.post("/detect/image/download", response_class=FileResponse)
+async def detect_image_download(
+    file: UploadFile = File(...),
+    confidence: float = 0.5
+):
+    """Detect threats in an uploaded image and return a downloadable image"""
+    try:
+        logger.info(f"Processing image download request: {file.filename}")
+
+        # Validate model service
+        if model_service is None:
+            raise RuntimeError("Model service not initialized")
+
+        # Validate file type
+        if file.content_type not in SUPPORTED_IMAGE_TYPES:
+            logger.warning(f"Unsupported file type: {file.content_type}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Supported types: {SUPPORTED_IMAGE_TYPES}"
+            )
+
         # Read and process image
         try:
             contents = await file.read()
-            logger.info(f"Image size: {len(contents)} bytes")
-            
-            # Process image using our helper function
+            logger.info(f"Read image data: {len(contents)} bytes")
+
             image = process_image(contents)
-            
+            logger.info(f"Processed image shape: {image.shape}")
+
             if image is None or image.size == 0:
                 raise ValueError("Failed to load image")
-                
-            logger.info(f"Successfully loaded image with shape: {image.shape}")
-            
+
         except Exception as e:
-            logger.error(f"Error reading image: {str(e)}")
+            logger.error(f"Error processing image: {str(e)}")
             logger.error(traceback.format_exc())
-            raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
-        
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to process image: {str(e)}"
+            )
+
         # Validate confidence
         if not 0 <= confidence <= 1:
             raise HTTPException(
                 status_code=400,
                 detail="Confidence must be between 0 and 1"
             )
-        
+
         # Perform detection
-        logger.info("Performing detection...")
-        results = model_service.detect_image(image, confidence)
-        logger.info(f"Detection completed. Found {len(results.detections)} threats")
-        
-        return results
-        
+        try:
+            logger.info("Running detection...")
+            results = model_service.detect_image(image, confidence)
+            logger.info(
+                f"Detection completed with {len(results.detections)} results")
+
+        except Exception as e:
+            logger.error(f"Error during detection: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Detection failed: {str(e)}"
+            )
+
+        # Draw bounding boxes and save image
+        try:
+            image_rgb = image.copy()
+            for detection in results.detections:
+                x1, y1, x2, y2 = detection.bbox
+                cv2.rectangle(
+                    image_rgb,
+                    (int(x1), int(y1)),
+                    (int(x2), int(y2)),
+                    (0, 255, 0),
+                    2
+                )
+                cv2.putText(
+                    image_rgb,
+                    f"{detection.class_name} ({detection.confidence:.2f})",
+                    (int(x1), int(y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 0, 255),
+                    2
+                )
+
+            # Convert to BGR for OpenCV operations
+            image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+            # Create a temporary file with a context manager
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+                temp_path = temp_file.name
+                cv2.imwrite(temp_path, image_bgr)
+                logger.info(
+                    f"Saved processed image to temporary file: {temp_path}")
+
+            # Return the file response with background cleanup task
+            return FileResponse(
+                temp_path,
+                media_type='image/jpeg',
+                filename=f'processed_{file.filename}',
+                background=BackgroundTask(lambda: os.unlink(temp_path))
+            )
+
+        except Exception as e:
+            logger.error(f"Error saving detection results: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to save detection results: {str(e)}"
+            )
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing image: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         )
+
+@app.post("/detect/video", response_model=DetectionResponse)
+async def detect_video(
+    file: UploadFile = File(...),
+    confidence: float = 0.5
+):
+    """Detect threats in an uploaded video"""
+    global model_service
+
+    try:
+        logger.info(f"Processing video detection request: {file.filename}")
+
+        # Validate model service
+        if model_service is None:
+            raise RuntimeError("Model service not initialized")
+
+        # Validate file type
+        if file.content_type not in SUPPORTED_VIDEO_TYPES:
+            logger.info(f"File type: {file.content_type}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Supported types: {SUPPORTED_VIDEO_TYPES}"
+            )
+
+        # Read and process video
+        try:
+            contents = await file.read()
+            logger.info(f"Video size: {len(contents)} bytes")
+
+            # Process video using our helper function
+            temp_file = tempfile.NamedTemporaryFile(suffix='.mp4')
+            temp_file.write(contents)
+            temp_file.seek(0)
+
+            cap = cv2.VideoCapture(temp_file.name)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter('output.mp4', fourcc, fps, (width, height))
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Perform detection
+                results = model_service.detect_image(frame, confidence)
+
+                # Draw bounding boxes on the frame
+                for detection in results.detections:
+                    x1, y1, x2, y2 = detection.bbox
+                    cv2.rectangle(frame, (int(x1), int(y1)),
+                                  (int(x2), int(y2)), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{detection.class_name} ({detection.confidence:.2f})", (int(
+                        x1), int(y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+                out.write(frame)
+
+            cap.release()
+            out.release()
+            cv2.destroyAllWindows()
+
+            # Return the modified video
+            with open('output.mp4', 'rb') as f:
+                video_bytes = f.read()
+
+            return {"video": video_bytes}
+
+        except Exception as e:
+            logger.error(f"Error reading video: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=400, detail=f"Invalid video file: {str(e)}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing video: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/detect/video/download", response_class=FileResponse)
+async def detect_video_download(
+    file: UploadFile = File(...),
+    confidence: float = 0.5
+):
+    """Detect threats in an uploaded video and return a downloadable video"""
+    global model_service
+
+    try:
+        logger.info(f"Processing video detection request: {file.filename}")
+
+        # Validate model service
+        if model_service is None:
+            raise RuntimeError("Model service not initialized")
+
+        # Validate file type
+        if file.content_type not in SUPPORTED_VIDEO_TYPES:
+            logger.info(f"File type: {file.content_type}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Supported types: {SUPPORTED_VIDEO_TYPES}"
+            )
+
+        # Read and process video
+        try:
+            contents = await file.read()
+            logger.info(f"Video size: {len(contents)} bytes")
+
+            # Process video using our helper function
+            temp_file = tempfile.NamedTemporaryFile(suffix='.mp4')
+            temp_file.write(contents)
+            temp_file.seek(0)
+
+            cap = cv2.VideoCapture(temp_file.name)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter('output.mp4', fourcc, fps, (width, height))
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Perform detection
+                results = model_service.detect_image(frame, confidence)
+
+                # Draw bounding boxes on the frame
+                for detection in results.detections:
+                    x1, y1, x2, y2 = detection.bbox
+                    cv2.rectangle(frame, (int(x1), int(y1)),
+                                  (int(x2), int(y2)), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{detection.class_name} ({detection.confidence:.2f})", (int(
+                        x1), int(y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+                out.write(frame)
+
+            cap.release()
+            out.release()
+            cv2.destroyAllWindows()
+
+            # Return the modified video as a downloadable file
+            return FileResponse('output.mp4', media_type='video/mp4', filename='output.mp4')
+
+        except Exception as e:
+            logger.error(f"Error reading video: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=400, detail=f"Invalid video file: {str(e)}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing video: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}")
+
 
 @app.get("/model/info")
 async def get_model_info():
@@ -182,6 +530,7 @@ async def get_model_info():
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
+
 ================================================================================
 
 
@@ -193,7 +542,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 class DetectionResult(BaseModel):
-    """Single detection result from the model"""
+    """
+    Single detection result from the model
+    """
     class_id: int
     class_name: str
     confidence: float
@@ -203,11 +554,9 @@ class DetectionResponse(BaseModel):
     """Response model for detection endpoints"""
     detections: List[DetectionResult]
     processing_time: float
-# Get the absolute path of the current file
 file_path = Path(__file__).resolve()
 root_path = file_path.parent
 
-# Add the root path to the sys.path list if it is not already there
 if root_path not in sys.path:
     sys.path.append(str(root_path))
 
@@ -215,7 +564,7 @@ if root_path not in sys.path:
 DETECTION_MODEL = root_path / 'data' / 'models' / 'BestFinal.pt'
 
 # API Settings
-MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
+MAX_UPLOAD_SIZE = 1000 * 1024 * 1024 
 SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/bmp", "image/webp"]
 SUPPORTED_VIDEO_TYPES = ["video/mp4", "video/x-msvideo"]
 
@@ -247,7 +596,6 @@ class ModelService:
         self.model = None
 
     def initialize_model(self, model_path: str):
-        """Initialize the YOLO model"""
         try:
             logger.info(f"Loading model from {model_path}")
             if not Path(model_path).exists():
@@ -260,7 +608,7 @@ class ModelService:
             raise
 
     def _process_results(self, results) -> DetectionResponse:
-        """Process YOLO results into structured response"""
+       
         try:
             detections = []
             
@@ -284,16 +632,15 @@ class ModelService:
             raise
 
     def detect_image(self, image: Union[np.ndarray, Image.Image], conf: float) -> DetectionResponse:
-        """Perform detection on a single image"""
         try:
             if self.model is None:
                 raise RuntimeError("Model not initialized")
 
-            # Convert PIL Image to numpy array if needed
+            # PIL Image to numpy array
             if isinstance(image, Image.Image):
                 image = np.array(image)
 
-            # Ensure image is in correct format
+            # image is in correct format
             if image.dtype != np.uint8:
                 image = image.astype(np.uint8)
 
@@ -328,7 +675,8 @@ DETECTION_MODEL = root_path / 'data' / 'models' / 'BestFinal.pt'
 
 # API Settings
 MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB
-SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/bmp", "image/webp"]
+SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png",
+                         "image/bmp", "image/webp", "image/gif", "image/tiff"]
 SUPPORTED_VIDEO_TYPES = ["video/mp4", "video/x-msvideo"]
 
 # Logging config

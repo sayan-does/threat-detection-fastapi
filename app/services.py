@@ -17,7 +17,6 @@ class ModelService:
         self.model = None
 
     def initialize_model(self, model_path: str):
-        """Initialize the YOLO model"""
         try:
             logger.info(f"Loading model from {model_path}")
             if not Path(model_path).exists():
@@ -30,7 +29,7 @@ class ModelService:
             raise
 
     def _process_results(self, results) -> DetectionResponse:
-        """Process YOLO results into structured response"""
+       
         try:
             detections = []
             
@@ -54,16 +53,15 @@ class ModelService:
             raise
 
     def detect_image(self, image: Union[np.ndarray, Image.Image], conf: float) -> DetectionResponse:
-        """Perform detection on a single image"""
         try:
             if self.model is None:
                 raise RuntimeError("Model not initialized")
 
-            # Convert PIL Image to numpy array if needed
+            # PIL Image to numpy array
             if isinstance(image, Image.Image):
                 image = np.array(image)
 
-            # Ensure image is in correct format
+            # image is in correct format
             if image.dtype != np.uint8:
                 image = image.astype(np.uint8)
 
